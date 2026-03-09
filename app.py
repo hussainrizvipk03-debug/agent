@@ -3,46 +3,90 @@ import pandas as pd
 import tools
 import matplotlib.pyplot as plt
 import io
-import re
-from llm import chain
+from agent import agent
 
 # Page configuration
-st.set_page_config(page_title="AI Data Scientist", layout="wide", page_icon="📊")
+st.set_page_config(page_title="AI Data Scientist", layout="wide", page_icon="🤖")
 
 st.title("🤖 AI Data Scientist")
-st.markdown("Upload your dataset and chat with me to analyze your data step-by-step.")
+st.markdown("Simply upload your dataset, and the agent will automatically perform a full analysis for you.")
 
-# Initialize session state for chat history
+# Initialize session state for chat history and auto-run status
 if "messages" not in st.session_state:
     st.session_state.messages = []
+if "last_uploaded" not in st.session_state:
+    st.session_state.last_uploaded = None
 
-# Sidebar for instructions and clear history
+# Sidebar for controls
 with st.sidebar:
     st.header("⚙️ Controls")
-    if st.button("Clear Chat History"):
+    if st.button("Clear Chat / Reset"):
         st.session_state.messages = []
+        st.session_state.last_uploaded = None
         st.rerun()
     st.markdown("---")
-    st.write("1. Upload a CSV file.")
-    st.write("2. Ask questions about your data.")
-    st.write("3. View visual outputs directly in chat.")
+    st.write("### Agent Status")
+    if st.session_state.last_uploaded:
+        st.success("✅ Analysis Complete")
+    else:
+        st.info("🕒 Waiting for data...")
 
 # 1. File Upload
-uploaded_file = st.file_uploader("Choose a CSV file", type="csv")
+uploaded_file = st.file_uploader("Upload CSV", type="csv")
 
 if uploaded_file is not None:
-    # Cache the dataframe to avoid re-reading on every rerun
     @st.cache_data
     def load_data(file):
         return pd.read_csv(file)
     
     df = load_data(uploaded_file)
-    st.success(f"Loaded dataset with {df.shape[0]} rows and {df.shape[1]} columns.")
     
-    with st.expander("📊 Preview Data"):
-        st.dataframe(df.head())
+    # Auto-run Agent Analysis if it's a new file
+    if st.session_state.last_uploaded != uploaded_file.name:
+        st.session_state.last_uploaded = uploaded_file.name
+        
+        with st.chat_message("assistant"):
+            with st.status("🚀 Running Full Autonomous Dashboard...", expanded=True) as status:
+                try:
+                    # Requesting full analysis
+                    raw_response = agent.run("Perform a Full Comprehensive Analysis. Run every single tool from your mapping (Info, Stats, Missing, Correlation, Heatmap, Top Features, and Visualizations) based on the dataset.", df)
+                    thought, actions = agent.parse_action(raw_response)
+                    
+                    if thought:
+                        st.info(f"**STRATEGY:** {thought}")
+                    
+                    # Execute each step in the plan
+                    for i, (tool_name, args_str) in enumerate(actions):
+                        st.write(f"📊 Running {tool_name}...")
+                        result = agent.execute_tool(tool_name, args_str, df)
+                        
+                        new_msg = {"role": "assistant", "content": f"**Full Analysis Step {i+1}:** Output from `{tool_name}`"}
+                        
+                        if hasattr(result, "savefig"):
+                            st.pyplot(result)
+                            buf = io.BytesIO()
+                            result.savefig(buf, format="png", bbox_inches='tight')
+                            buf.seek(0)
+                            new_msg["visualization_bytes"] = buf.getvalue()
+                            plt.close(result) 
+                        elif isinstance(result, pd.DataFrame):
+                            st.dataframe(result)
+                            new_msg["result"] = result
+                        else:
+                            st.markdown(f"**Result:** {result}")
+                            new_msg["result"] = str(result)
+                        
+                        st.session_state.messages.append(new_msg)
+                    
+                    status.update(label="✅ All Tools Executed Successfully", state="complete", expanded=False)
+                    st.rerun() 
+                except Exception as e:
+                    status.update(label="❌ Failure", state="error", expanded=True)
+                    st.error(f"Auto-Analysis Error: {str(e)}")
 
-    # Display chat messages
+    # Display Analysis Dashboard (History)
+    st.divider()
+    st.subheader("📋 Analysis Dashboard")
     for message in st.session_state.messages:
         with st.chat_message(message["role"]):
             st.markdown(message["content"])
@@ -52,84 +96,38 @@ if uploaded_file is not None:
                 if isinstance(message["result"], pd.DataFrame):
                     st.dataframe(message["result"])
                 else:
-                    st.text(message["result"])
+                    st.text(str(message["result"]))
 
-    # Chat Input
-    if user_query := st.chat_input("Ask about your data (e.g., 'Plot histogram of Age')..."):
+    # Manual chat if user wants more
+    if user_query := st.chat_input("I have more questions..."):
         st.session_state.messages.append({"role": "user", "content": user_query})
         with st.chat_message("user"):
             st.markdown(user_query)
 
-        # Agent logic and visualization
         with st.chat_message("assistant"):
-            with st.status("🛠️ AI Analysis Flow", expanded=True) as status:
-                st.write("🔍 Analyzing request...")
+            with st.status("🧠 Processing...", expanded=True) as status:
                 try:
-                    full_response = chain.invoke({"user_query": user_query})
-                    
-                    # More robust regex for function extraction
-                    match = re.search(r'(\w+)\s*\((.*)\)', full_response)
-                    
-                    if match:
-                        tool_name = match.group(1).strip()
-                        args_str = match.group(2).strip()
-                        
-                        st.write(f"⚙️ Selected Tool: `{tool_name}`")
-                        
-                        # Parse arguments
-                        kwargs = {}
-                        if args_str:
-                            # Handle simple key=value or key='value'
-                            parts = re.findall(r'(\w+)\s*=\s*(?:["\']([^"\']*)["\']|(\w+))', args_str)
-                            for k, v1, v2 in parts:
-                                kwargs[k] = v1 if v1 else v2
-                        
-                        st.write(f"🚀 Executing with args: `{kwargs}`")
-                        
-                        if hasattr(tools, tool_name):
-                            method = getattr(tools, tool_name)
-                            # Actual tool execution
-                            result = method(df, **kwargs)
-                            
-                            st.write("✅ Data processed. Rendering output...")
-                            status.update(label="Analysis Complete", state="complete", expanded=False)
-                            
-                            new_msg = {"role": "assistant", "content": f"Here is the analysis result for `{tool_name}`:"}
-                            
-                            # Determine result type and display
-                            if hasattr(result, "savefig"):
-                                # It's a matplotlib figure
-                                st.pyplot(result)
-                                
-                                # Export to bytes for history persistence
-                                buf = io.BytesIO()
-                                result.savefig(buf, format="png", bbox_inches='tight')
-                                buf.seek(0)
-                                new_msg["visualization_bytes"] = buf.getvalue()
-                                plt.close(result) 
-                            elif isinstance(result, pd.DataFrame):
-                                st.dataframe(result)
-                                new_msg["result"] = result
-                            elif isinstance(result, (pd.Series, dict)):
-                                st.write(result)
-                                new_msg["result"] = str(result)
-                            else:
-                                st.markdown(result)
-                                new_msg["result"] = str(result)
-                            
-                            st.session_state.messages.append(new_msg)
+                    response = agent.run(user_query, df)
+                    thought, actions = agent.parse_action(response)
+                    for i, (tool_name, args_str) in enumerate(actions):
+                        result = agent.execute_tool(tool_name, args_str, df)
+                        new_msg = {"role": "assistant", "content": f"**Action:** `{tool_name}`"}
+                        if hasattr(result, "savefig"):
+                            st.pyplot(result)
+                            buf = io.BytesIO()
+                            result.savefig(buf, format="png", bbox_inches='tight')
+                            buf.seek(0)
+                            new_msg["visualization_bytes"] = buf.getvalue()
+                            plt.close(result) 
+                        elif isinstance(result, pd.DataFrame):
+                            st.dataframe(result)
+                            new_msg["result"] = result
                         else:
-                            status.update(label="⚠️ Tool Error", state="error", expanded=True)
-                            st.error(f"Function `{tool_name}` not found in tools.py")
-                    else:
-                        # Direct text answer
-                        status.update(label="💡 Response", state="complete", expanded=False)
-                        st.write(full_response)
-                        st.session_state.messages.append({"role": "assistant", "content": full_response})
-                        
+                            st.markdown(result)
+                            new_msg["result"] = str(result)
+                        st.session_state.messages.append(new_msg)
+                    status.update(label="Done", state="complete", expanded=False)
                 except Exception as e:
-                    status.update(label="❌ Failure", state="error", expanded=True)
-                    st.error(f"Execution Error: {str(e)}")
-                    st.info("Check if column names are correct or if the tool supports this query.")
+                    st.error(f"Error: {e}")
 else:
-    st.info("👋 Welcome! Please upload a CSV file to begin analysis.")
+    st.info("👋 Upload a CSV file and I will automatically handle the rest!")
