@@ -15,24 +15,11 @@ from pydantic import BaseModel, Field
 
 # --- SCHEMA DEFINITIONS ---
 
-class BreakdownResult(BaseModel):
-    intent: str = Field(description="The primary goal (e.g., 'analysis', 'cleaning', 'specific_question')")
-    parameters: List[str] = Field(description="Column names or features identified")
-    is_ambiguous: bool = Field(description="True if query is unclear or columns are ambiguous")
-    missing_info: str = Field(description="What information is missing to proceed?")
-
-# --- TOOLS ---
-
-@tool
-def breakdown_complex_prompt(query: str, columns: List[str]) -> str:
-    """Analyzes and breaks down a complex data analysis request into manageable steps."""
-    # This tool is used by the model to structure its thought process
-    return f"Prompt broken down. Columns identified: {columns}"
-
-@tool
-def throw_ui_clarification(question: str) -> str:
-    """Throws a clarification widget in the UI to ask the user for more information."""
-    return f"QUESTION TO USER: {question}"
+class AutonomousPlan(TypedDict):
+    is_ready: bool
+    plan_description: str
+    selected_columns: List[str]
+    clarification_question: str
 
 # --- STATE DEFINITION ---
 
@@ -40,75 +27,118 @@ class AgentState(TypedDict):
     messages: Annotated[Sequence[BaseMessage], operator.add]
     df: pd.DataFrame
     figures: Annotated[Dict[str, Any], operator.ior]
-    breakdown_data: Dict[str, Any]
-    next_node: str
+    plan: AutonomousPlan
+    phase: str 
 
-# --- GRAPH NODES ---
+# --- NODES ---
 
-def node_prompt_breakdown(state: AgentState):
-    """Image Node: 'prompt breakdown'"""
-    llm = get_llm().with_structured_output(BreakdownResult)
-    query = state['messages'][-1].content
-    columns = state['df'].columns.tolist()
+def node_eda_diagnostics(state: AgentState):
+    """
+    Phase 1: Forceful WHOLE EDA Diagnostics with Multi-turn Awareness.
+    This node will be called repeatedly until all 5 steps are confirmed.
+    """
+    llm = get_llm().bind_tools([
+        tools.get_data_info,
+        tools.get_data_stats,
+        tools.check_missing_values,
+        tools.drop_missing_values,
+        tools.fill_missing_values,
+        tools.get_correlation_matrix
+    ])
+    
+    # Check what we have done so far by looking at tool outputs
+    history = str([m.content for m in state['messages'] if isinstance(m, ToolMessage)])
     
     prompt = f"""
-    Break down this user query: '{query}'
-    Available columns: {columns}
-    If there is any ambiguity (e.g. multiple matching columns), mark is_ambiguous as True and provide a question.
+    You are in the MANDATORY WHOLE EDA phase. You must perform ALL of these tools:
+    1. get_data_info() - Report dimensions.
+    2. get_data_stats() - Report full statistics for all columns.
+    3. check_missing_values() - Detect nulls.
+    4. IF NULLS ARE DETECTED (look at history): You MUST call drop_missing_values() or fill_missing_values() to fix them.
+    5. get_correlation_matrix() - Finalize numerical relationships.
+
+    Current Tool Progress History: {history}
+    
+    YOUR GOAL: If any step is missing or if nulls were found but not fixed, call the necessary tools NOW.
+    Only if ALL 5 steps are complete and the data is clean, output a summary and say 'DIAGNOSTICS_COMPLETE'.
     """
     
-    analysis = llm.invoke(prompt)
+    messages = [SystemMessage(content=prompt)] + list(state['messages'])
+    # If the history is empty, add the initial prompt
+    if not any(isinstance(m, HumanMessage) for m in state['messages']):
+        messages.append(HumanMessage(content="Start Whole EDA Diagnostics."))
     
-    # Decide next step
-    if analysis.is_ambiguous:
-        next_step = "clarification"
-    else:
-        next_step = "router"
-        
+    response = llm.invoke(messages)
     return {
-        "breakdown_data": analysis.dict(),
-        "next_node": next_step
+        "messages": [response],
+        "phase": "diagnostic"
     }
 
-def node_clarification_questions(state: AgentState):
-    """Image Node: 'clarification questions'"""
-    # This node uses the breakdown data to prepare a UI question
-    question = state['breakdown_data']['missing_info']
+def node_autonomous_refinement(state: AgentState):
+    """
+    Phase 2: Self-Analysis & Visualization Planning.
+    Includes Univariate, Bivariate, AND Multivariate planning.
+    """
+    class PlanningSchema(BaseModel):
+        is_ready: bool = Field(description="True if diagnostics are done and we can visualize.")
+        plan_description: str = Field(description="Describe the plan for Uni, Bi, and MULTIVARIATE plots.")
+        selected_columns: List[str] = Field(description="EXACT column names to be used.")
+        clarification_question: str = Field(description="Question if stuck.")
+
+    llm = get_llm().with_structured_output(PlanningSchema)
+    
+    cols = state['df'].columns.tolist()
+    
+    prompt = f"""
+    WHOLE EDA is complete. The data has been cleaned.
+    Available Columns: {cols}
+    
+    TASK:
+    1. Autonomously plan a comprehensive visual suite.
+    2. Include at least:
+       - Univariate analysis for key features.
+       - Bivariate analysis for the strongest correlations.
+       - MULTIVARIATE analysis (pairplots) for the top 3-4 features.
+    3. Set is_ready=True and provide the exact plan.
+    """
+    
+    plan_obj = llm.invoke(prompt)
+    
     return {
-        "messages": [AIMessage(content=f"QUESTION TO USER: {question}")]
+        "plan": plan_obj.model_dump(),
+        "phase": "refinement"
     }
 
-def node_ai_router(state: AgentState):
-    """Image Node: 'AI Router'"""
-    # Simply routes to EDA for now, but structures for future RAG/VectorDB routing
-    return {"next_node": "eda"}
-
-def node_eda_engine(state: AgentState):
-    """Autonomous EDA Engine using specialized tools."""
+def node_visualization_engine(state: AgentState):
+    """
+    Phase 3: Autonomous Visualization Execution.
+    """
     llm = get_llm().bind_tools([
-        tools.get_data_info, 
-        tools.get_data_stats, 
-        tools.check_missing_values, 
-        tools.drop_missing_values, 
-        tools.fill_missing_values, 
-        tools.get_correlation_matrix,
-        tools.plot_histogram, 
-        tools.plot_correlation_heatmap, 
-        tools.plot_scatter,
+        tools.plot_univariate_analysis,
+        tools.plot_bivariate_analysis,
+        tools.plot_multivariate_analysis,
+        tools.plot_correlation_heatmap,
         tools.get_top_features
     ])
     
-    messages = [SystemMessage(content=f"You are executing an EDA plan. Context: {state['breakdown_data']}")] + list(state['messages'])
+    plan_desc = state['plan']['plan_description']
+    prompt = f"Executing full visualization suite including Multivariate analysis. Plan: {plan_desc}. Call ALL planned tools now."
+    
+    messages = [SystemMessage(content=prompt)] + list(state['messages'])
     response = llm.invoke(messages)
-    return {"messages": [response]}
+    
+    return {
+        "messages": [response],
+        "phase": "execution"
+    }
 
 def node_execute_tools(state: AgentState):
-    """Executed when tools need to be called."""
+    """Bridge for @tool calls. Handles dataframe updates for cleaning."""
     last_message = state['messages'][-1]
     tool_messages = []
     new_figures = {}
+    updated_df = state['df']
     
-    # Safety check: ensure last message is an AIMessage with tool calls
     if not hasattr(last_message, 'tool_calls') or not last_message.tool_calls:
         return {"messages": []}
 
@@ -116,80 +146,98 @@ def node_execute_tools(state: AgentState):
         tool_name = tool_call['name']
         args = tool_call['args'].copy()
         
-        # Inject the dataframe if the tool is from our tools module
         if hasattr(tools, tool_name):
-            args['df'] = state['df']
+            args['df'] = updated_df
         
         try:
-            # Safely get and invoke the tool
             tool_func = getattr(tools, tool_name)
             result = tool_func.invoke(args)
             
-            # Handle visualization outputs
             if isinstance(result, plt.Figure):
                 fig_id = f"fig_{tool_call['id']}"
                 new_figures[fig_id] = result
-                content = f"Plot generated: {fig_id}"
+                content = f"Visual Generated: {fig_id}"
             elif isinstance(result, pd.DataFrame):
-                content = result.to_string()
+                updated_df = result
+                content = f"Cleaning complete. Dataframe updated. New shape: {updated_df.shape}"
             else:
                 content = str(result)
                 
-            tool_messages.append(ToolMessage(
-                tool_call_id=tool_call['id'], 
-                content=content
-            ))
+            tool_messages.append(ToolMessage(tool_call_id=tool_call['id'], content=content))
         except Exception as e:
-            # Provide descriptive error messages for debugging
-            error_content = f"Error executing {tool_name}: {str(e)}"
-            tool_messages.append(ToolMessage(
-                tool_call_id=tool_call['id'], 
-                content=error_content
-            ))
+            tool_messages.append(ToolMessage(tool_call_id=tool_call['id'], content=f"Error in {tool_name}: {str(e)}"))
             
-    return {"messages": tool_messages, "figures": new_figures}
+    return {
+        "messages": tool_messages, 
+        "figures": new_figures,
+        "df": updated_df
+    }
 
-# --- ROUTING LOGIC ---
+# --- CONTROL FLOW ---
 
-def route_breakdown(state: AgentState):
-    return state['next_node'] # 'clarification' or 'router'
+def route_initial(state: AgentState):
+    # Always check if 'DIAGNOSTICS_COMPLETE' has been said
+    last_tool_output = [m.content for m in state['messages'] if isinstance(m, ToolMessage)]
+    # If no tools run yet, go to diagnostics
+    if not last_tool_output:
+        return "diagnostics"
+    return "refine"
 
-def should_continue_eda(state: AgentState):
-    last_message = state['messages'][-1]
-    if isinstance(last_message, AIMessage) and last_message.tool_calls:
+def route_after_tools(state: AgentState):
+    last_msg = state['messages'][-1]
+    if isinstance(last_msg, AIMessage) and last_msg.tool_calls:
         return "tools"
+    
+    # If in diagnostic phase, loop back to check if we've actually done all 5 steps
+    if state['phase'] == 'diagnostic':
+        # Check if the LLM has finalized diagnostics
+        if "DIAGNOSTICS_COMPLETE" in state['messages'][-1].content:
+            return "refine"
+        return "diagnostics"
+        
     return END
 
-# --- GRAPH CONSTRUCTION ---
+def route_refinement(state: AgentState):
+    if state['plan'].get('is_ready'):
+        return "visualize"
+    return END
+
+# --- GRAPH ---
 
 workflow = StateGraph(AgentState)
 
-# Following the image nodes
-workflow.add_node("prompt_breakdown", node_prompt_breakdown)
-workflow.add_node("clarification_questions", node_clarification_questions)
-workflow.add_node("ai_router", node_ai_router)
-workflow.add_node("eda_engine", node_eda_engine)
+workflow.add_node("diagnostics", node_eda_diagnostics)
+workflow.add_node("refine", node_autonomous_refinement)
+workflow.add_node("visualize", node_visualization_engine)
 workflow.add_node("tools", node_execute_tools)
 
-workflow.add_edge(START, "prompt_breakdown")
-
-workflow.add_conditional_edges("prompt_breakdown", route_breakdown, {
-    "clarification": "clarification_questions",
-    "router": "ai_router"
+workflow.add_conditional_edges(START, route_initial, {
+    "diagnostics": "diagnostics",
+    "refine": "refine"
 })
 
-workflow.add_edge("clarification_questions", END) # HITL stop
-
-workflow.add_edge("ai_router", "eda_engine")
-
-workflow.add_conditional_edges("eda_engine", should_continue_eda, {
+workflow.add_conditional_edges("diagnostics", route_after_tools, {
     "tools": "tools",
+    "diagnostics": "diagnostics",
+    "refine": "refine"
+})
+
+workflow.add_conditional_edges("tools", route_after_tools, {
+    "tools": "tools",
+    "diagnostics": "diagnostics",
+    "refine": "refine",
     END: END
 })
 
-workflow.add_edge("tools", "eda_engine")
+workflow.add_conditional_edges("refine", route_refinement, {
+    "visualize": "visualize",
+    END: END
+})
 
-# --- COMPILE ---
+workflow.add_conditional_edges("visualize", route_after_tools, {
+    "tools": "tools",
+    END: END
+})
 
 agent_graph = workflow.compile()
 
@@ -199,16 +247,15 @@ class DataAgent:
 
     def run(self, user_query: str, df: pd.DataFrame, messages_history: list = None):
         messages = messages_history if messages_history else []
-        # Ensure latest query is at the end
-        if not messages or not isinstance(messages[-1], HumanMessage) or messages[-1].content != user_query:
+        if user_query and (not messages or not isinstance(messages[-1], HumanMessage) or messages[-1].content != user_query):
             messages.append(HumanMessage(content=user_query))
             
         initial_state = {
             "messages": messages,
             "df": df,
             "figures": {},
-            "breakdown_data": {},
-            "next_node": ""
+            "plan": {"is_ready": False, "plan_description": "", "selected_columns": [], "clarification_question": ""},
+            "phase": ""
         }
         
         return self.graph.invoke(initial_state)
