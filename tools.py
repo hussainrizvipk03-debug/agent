@@ -87,6 +87,22 @@ def plot_correlation_heatmap(df: Annotated[Any, InjectedToolArg()]):
     return fig
 
 @tool
+def label_encode_categorical_columns(df: Annotated[Any, InjectedToolArg()], columns: list = None):
+    """
+    Converts categorical (object/string) columns into numeric using label encoding.
+    If 'columns' is None, it targets all object-type columns automatically.
+    Use this to prepare data for ML models.
+    """
+    df_encoded = df.copy()
+    target_cols = columns if columns else df_encoded.select_dtypes(include=['object']).columns.tolist()
+    
+    for col in target_cols:
+        if col in df_encoded.columns:
+            df_encoded[col] = pd.factorize(df_encoded[col])[0]
+            
+    return df_encoded
+
+@tool
 def get_top_features(df: Annotated[Any, InjectedToolArg()], target_col: str):
     """Finds the top 5 features most correlated with a target column."""
     if target_col not in df.columns:

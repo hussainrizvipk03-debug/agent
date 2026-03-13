@@ -24,6 +24,8 @@ if "raw_messages" not in st.session_state:
     st.session_state.raw_messages = []
 if "last_dataset" not in st.session_state:
     st.session_state.last_dataset = None
+if "df" not in st.session_state:
+    st.session_state.df = None
 
 # Sidebar for controls
 with st.sidebar:
@@ -32,6 +34,7 @@ with st.sidebar:
         st.session_state.chat_history = []
         st.session_state.raw_messages = []
         st.session_state.last_dataset = None
+        st.session_state.df = None
         if "mcqs" in st.session_state:
             del st.session_state["mcqs"]
         st.rerun()
@@ -48,7 +51,25 @@ with st.sidebar:
             st.session_state.chat_history = []
             st.session_state.raw_messages = []
             st.session_state.last_dataset = f"sns_{selected_sns_dataset}"
+            st.session_state.df = None # Reset df to trigger reload
             st.rerun()
+
+    if st.session_state.df is not None:
+        st.divider()
+        st.header("📥 Export Data")
+        
+        @st.cache_data
+        def convert_df(df):
+            return df.to_csv(index=False).encode('utf-8')
+
+        csv = convert_df(st.session_state.df)
+        st.download_button(
+            label="Download Cleaned Dataset",
+            data=csv,
+            file_name="cleaned_dataset.csv",
+            mime="text/csv",
+            use_container_width=True,
+        )
 
 # Helper to process graph messages into streamlit-friendly chat history
 def process_messages_to_history(messages, figures):
@@ -77,26 +98,27 @@ def process_messages_to_history(messages, figures):
     return processed
 
 # Data Loading Logic
-df = None
-if st.session_state.last_dataset and st.session_state.last_dataset.startswith("sns_"):
+if st.session_state.last_dataset and st.session_state.last_dataset.startswith("sns_") and st.session_state.df is None:
     dataset_name = st.session_state.last_dataset.replace("sns_", "")
-    df = sns.load_dataset(dataset_name)
+    st.session_state.df = sns.load_dataset(dataset_name)
     st.success(f"✅ Seaborn '{dataset_name}' dataset loaded successfully!")
-else:
+elif not st.session_state.last_dataset or not st.session_state.last_dataset.startswith("sns_"):
     uploaded_file = st.file_uploader("Upload CSV", type="csv")
     if uploaded_file is not None:
-        df = pd.read_csv(uploaded_file)
         if st.session_state.last_dataset != uploaded_file.name:
+            st.session_state.df = pd.read_csv(uploaded_file)
             st.session_state.last_dataset = uploaded_file.name
             st.session_state.chat_history = []
             st.session_state.raw_messages = []
+            st.rerun()
 
 # Core Execution Pipeline
-if df is not None:
+if st.session_state.df is not None:
     if not st.session_state.chat_history:
         with st.status("🚀 Launching Autonomous Whole EDA...", expanded=True) as status:
             try:
-                final_state = agent.run("", df.copy(), messages_history=[])
+                final_state = agent.run("", st.session_state.df.copy(), messages_history=[])
+                st.session_state.df = final_state['df']
                 st.session_state.raw_messages = final_state['messages']
                 st.session_state.chat_history = process_messages_to_history(final_state['messages'], final_state['figures'])
                 status.update(label="✅ Autonomous EDA & Visualization Complete", state="complete", expanded=False)
@@ -122,7 +144,8 @@ if df is not None:
         st.session_state.chat_history.append({"role": "user", "content": user_query})
         with st.status("🧠 Analyzing request...", expanded=True) as status:
             try:
-                final_state = agent.run(user_query, df.copy(), messages_history=st.session_state.raw_messages)
+                final_state = agent.run(user_query, st.session_state.df.copy(), messages_history=st.session_state.raw_messages)
+                st.session_state.df = final_state['df']
                 st.session_state.raw_messages = final_state['messages']
                 st.session_state.chat_history = process_messages_to_history(final_state['messages'], final_state['figures'])
                 status.update(label="✅ Completed", state="complete", expanded=False)
